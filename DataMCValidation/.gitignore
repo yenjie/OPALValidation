@@ -1,0 +1,6 @@
+# Build product and run outputs; only the sources are versioned.
+CompareDataMC
+output/
+test_output/
+*.root
+*.pdf
