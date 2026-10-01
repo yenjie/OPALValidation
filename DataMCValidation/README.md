@@ -93,6 +93,8 @@ Converted files on grendel01:
 /raid5/data/yjlee/OPAL/converted/1994/merged/OPAL_1994_mc_jt74mh.root   trees t, tgen, tgenBefore
 ```
 
+Every branch of these trees is explained in [NtupleVariables.md](NtupleVariables.md).
+
 ## Build and run
 
 ```bash
