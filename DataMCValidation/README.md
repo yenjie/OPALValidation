@@ -29,6 +29,61 @@ one-line explanation.
    near the peak from about 1% to about 7%; `--phiPMin 0` gives the inclusive
    spectrum.
 
+## The Monte Carlo: JETSET and GOPAL
+
+The simulated sample (`jt74mh/r2792`) was produced in three steps, and it
+helps to know which step is responsible for what when reading the plots.
+
+**JETSET 7.4 — the event generator (physics).** JETSET is the Lund Monte
+Carlo program by T. Sjöstrand, the ancestor of today's PYTHIA (the two were
+merged into PYTHIA 6 in 1997). For every event it generates
+e+e- -> Z/gamma* -> q qbar, lets the quarks radiate gluons in a parton shower,
+turns the partons into hadrons with the Lund string model (a colour string
+between the partons breaks by creating quark-antiquark pairs from the vacuum),
+and decays the unstable hadrons. The string model has a handful of tunable
+parameters -- the fragmentation function parameters a and b, the
+transverse-momentum width sigma_q, the strange-quark suppression s/u, the
+vector-to-pseudoscalar ratio -- which OPAL tuned to its own data
+(Z. Phys. C 69 (1996) 543). The sample tag `jt74mh` means "JETSET 7.4
+multihadron". JETSET's output, the list of final-state particles with their
+four-momenta, is what the `tgen` tree contains.
+
+**GOPAL — the detector simulation.** GOPAL ("GEANT-OPAL", J. Allison et al.,
+Nucl. Instrum. Meth. A317 (1992) 47) is OPAL's full detector simulation, built
+on CERN's GEANT 3 toolkit. It takes the particles from JETSET and
+
+1. tracks them through a detailed model of the detector: beam pipe, silicon
+   microvertex detector, vertex chamber (CV), jet chamber (CJ), z-chambers,
+   the 0.435 T solenoid, time-of-flight counters, lead-glass electromagnetic
+   calorimeter, hadron calorimeter, muon chambers and forward detectors;
+2. simulates the physics of their passage through matter: ionisation energy
+   loss, multiple scattering, decays in flight, photon conversions,
+   electromagnetic and hadronic showers, nuclear interactions;
+3. digitises the result, i.e. converts the energy deposits into hits and
+   pulse heights in the same format as real raw data, applying the measured
+   resolutions, efficiencies, dead channels and noise (its "smearing" package,
+   routines such as `SMSIEFF`, `SMSIDEAD`, `SMSIRES`).
+
+A control card `EXPT` selects the detector geometry and conditions of a given
+year; this sample has `EXPT 1005`, the 1994 detector, and was produced in
+March 1995 with the assigned Monte Carlo run number 2792. OPAL did not
+simulate every data run separately: one representative set of 1994 conditions
+is used for all 651,015 events.
+
+**ROPE — the reconstruction.** The digitised MC events are then processed by
+ROPE, the same reconstruction program (pass 7) that produced the real data, so
+from this point on data and simulation are treated identically. The
+reconstructed MC particles are the `t` tree of the MC file.
+
+Reading the validation plots with this chain in mind:
+
+| Observation | Mostly tests |
+|---|---|
+| MC has about 5% more tracks per event; pT shape within a few % | JETSET fragmentation tune (a, b, sigma_q) |
+| phi yield per event MC / data = 0.83 +- 0.12 | JETSET strangeness parameters (s/u, strange vector fraction) |
+| phi mass agrees to 0.5 MeV, resolution 3.1 vs 3.2 MeV | GOPAL tracking simulation and ROPE calibration |
+| data excess at 5-8 good tracks | generator scope: the sample is q qbar only, no tau pairs or two-photon events |
+
 ## Inputs
 
 Converted files on grendel01:
