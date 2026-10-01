@@ -104,6 +104,7 @@
 #include "TFile.h"             // reading and writing ROOT files
 #include "TFitResult.h"        // the result of a fit (status, parameters)
 #include "TFitResultPtr.h"
+#include "TGaxis.h"            // axis settings
 #include "TH1D.h"              // one-dimensional histograms with double precision
 #include "TLatex.h"            // text with LaTeX-like formatting on a plot
 #include "TLegend.h"           // the legend box of a plot
@@ -220,15 +221,18 @@ struct Config {
   double d0Max = 2.5;               // cm
   double z0Max = 50.0;              // cm
 
-  // phi -> K+K- candidate selection
+  // phi -> K+K- candidate selection.  Random pairs of soft tracks dominate
+  // the background near the K+K- threshold; asking for a fast pair raises the
+  // signal-to-background ratio from about 1% (no cut) to about 7% (6 GeV)
+  // while keeping most of the statistical significance.
   double kaonPMin = 0.0;            // minimum momentum of each kaon candidate [GeV]
-  double phiPMin = 0.0;             // minimum momentum of the pair [GeV]
+  double phiPMin = 6.0;             // minimum momentum of the pair [GeV]
 
   // Histogram binning and fit range for the K+K- mass
   double massLow = 0.98;            // GeV
   double massHigh = 1.10;           // GeV
   double massBinWidth = 0.001;      // GeV, i.e. 1 MeV bins
-  double fitLow = 0.990;            // GeV
+  double fitLow = 0.995;            // GeV, a few MeV above the K+K- threshold
   double fitHigh = 1.090;           // GeV
 
   // How to normalise the pT spectra: "event" or "area" (see NormalizedCopy)
@@ -273,8 +277,11 @@ Sample MakeSample(const std::string& tag, const std::string& label, const Config
   s.label = label;
 
   // The histogram title string ";x title;y title" sets the axis titles.
+  // Bins two tracks wide: at generator level the number of charged particles
+  // is almost always even (electric charge is conserved and the event starts
+  // neutral), which would make a one-track-wide histogram zigzag.
   s.hNGoodTracks = new TH1D(("hNGoodTracks_" + tag).c_str(),
-                            ";N_{good charged tracks};Events", 71, -0.5, 70.5);
+                            ";N_{good charged tracks};Events", 35, -0.5, 69.5);
 
   s.hPt = new TH1D(("hPt_" + tag).c_str(),
                    ";p_{T} [GeV];(1/N_{ev}) dN/dp_{T} [GeV^{-1}]", 100, 0.0, 10.0);
@@ -492,26 +499,40 @@ void FillHistogramsFromTree(TTree* tree, const Config& cfg, bool isGeneratorLeve
 //  its known value and let the fit determine sigma, i.e. the mass resolution.
 //
 //  Background.  Random pairs of tracks give a smooth spectrum that starts at
-//  the K+K- threshold 2*m_K = 0.987 GeV and rises from there.  We use the
-//  empirical shape  b0 * (m - 2m_K)^a * exp(c * (m - 2m_K)),  which is zero
-//  at threshold and flexible enough to follow the data in the fit range.
+//  the K+K- threshold 2*m_K = 0.987 GeV, rises almost vertically within a few
+//  MeV and then flattens.  Instead of guessing a formula for this shape we use
+//  the like-sign pairs (K+K+ and K-K-) as a template: they come from the same
+//  combinatorics but cannot contain a phi.  The like-sign spectrum is not
+//  exactly proportional to the opposite-sign background (opposite charges are
+//  produced next to each other slightly more often than equal charges, and
+//  decays of other resonances such as rho -> pi+pi- or K* -> K pi, with the
+//  wrong mass assigned, add broad bumps to opposite-sign pairs only), so the
+//  template is multiplied by a slowly varying polynomial
+//          p0 + p1 * dm + p2 * dm^2,        dm = m - 2*m_K.
+//  A quadratic changes over tens of MeV and cannot imitate the narrow phi;
+//  a more flexible polynomial would start to trade off against the signal.
+//  Very close to threshold the two charge combinations differ more strongly,
+//  which is why the fit starts a few MeV above threshold (--fitLow).
 //
 //  Fit parameters:  [0] N      number of phi mesons (the signal yield)
 //                   [1] m0     peak position
 //                   [2] sigma  Gaussian resolution
 //                   [3] Gamma  natural width (fixed)
-//                   [4] b0, [5] a, [6] c   background shape
+//                   [4] p0, [5] p1, [6] p2   scale factor of the template
 // =============================================================================
 
-// TF1 evaluates user functions through this C-style signature:
-// x[0] is the mass, p[] are the parameters.  The signal is multiplied by the
-// bin width so that N counts entries, not entries per GeV.
+// TF1 evaluates user functions through this C-style signature: x[0] is the
+// mass and p[] are the parameters.  Two things cannot be passed as parameters
+// and are therefore kept in file-level variables that are set before each
+// fit: the bin width (so that N counts entries, not entries per GeV) and the
+// like-sign template of the sample being fitted.
 double gMassBinWidth = 0.001;
+TH1D* gLikeSignTemplate = nullptr;
 
 double BackgroundFunction(double* x, double* p) {
   double dm = x[0] - kKKThreshold;
-  if (dm <= 0.0) return 0.0;
-  return p[0] * std::pow(dm, p[1]) * std::exp(p[2] * dm);
+  double likeSign = gLikeSignTemplate->GetBinContent(gLikeSignTemplate->FindBin(x[0]));
+  return likeSign * (p[0] + p[1] * dm + p[2] * dm * dm);
 }
 
 double SignalFunction(double* x, double* p) {
@@ -532,84 +553,103 @@ struct PhiFitResult {
   int ndf = 0;                      // ... per degree of freedom (chi2/ndf ~ 1 is good)
   double signalInWindow = 0;        // fitted signal within +- kSignalWindow of the peak
   double backgroundInWindow = 0;    // fitted background in the same window
-  TF1* total = nullptr;             // signal + background, for drawing
-  TF1* signal = nullptr;
-  TF1* background = nullptr;
+  TF1* signal = nullptr;            // the fitted signal curve
+  TH1D* background = nullptr;       // the fitted background, bin by bin
+  TH1D* total = nullptr;            // signal + background, bin by bin, for drawing
 };
 
-PhiFitResult FitPhiPeak(TH1D* h, const Config& cfg, const std::string& tag) {
+PhiFitResult FitPhiPeak(TH1D* oppositeSign, TH1D* likeSign, const Config& cfg, const std::string& tag) {
   PhiFitResult result;
-  gMassBinWidth = h->GetBinWidth(1);
+  gMassBinWidth = oppositeSign->GetBinWidth(1);
+  gLikeSignTemplate = likeSign;
 
-  TF1* total = new TF1(("fit_total_" + tag).c_str(), SignalPlusBackground, cfg.fitLow, cfg.fitHigh, 7);
-  total->SetParNames("N_{#phi}", "m_{#phi}", "#sigma", "#Gamma_{#phi}", "b_{0}", "a", "c");
-
-  // A fit needs reasonable starting values.  We estimate the background
-  // normalisation from the region above the peak (1.05-1.085 GeV), assuming
-  // the shape (m - 2m_K)^0.5, and the signal from the excess over that estimate
-  // within +- 10 MeV of the known phi mass.
-  const double aStart = 0.5;
-  const double cStart = 0.0;
-  double b0Start = 0.0;
-  int nReferenceBins = 0;
-  for (int bin = h->FindBin(1.050); bin <= h->FindBin(std::min(1.085, cfg.fitHigh)); ++bin) {
-    double dm = h->GetBinCenter(bin) - kKKThreshold;
-    if (dm <= 0.0) continue;
-    b0Start += h->GetBinContent(bin) / std::pow(dm, aStart);
-    ++nReferenceBins;
+  // A fit needs reasonable starting values.  The template scale p0 is the
+  // opposite-sign / like-sign ratio away from the peak; the signal is the
+  // excess over p0 * like-sign within +- 10 MeV of the known phi mass.
+  double sumOppositeSign = 0.0;
+  double sumLikeSign = 0.0;
+  for (int bin = oppositeSign->FindBin(cfg.fitLow); bin <= oppositeSign->FindBin(cfg.fitHigh); ++bin) {
+    double m = oppositeSign->GetBinCenter(bin);
+    if (std::fabs(m - kPhiMassPDG) < 2.0 * kSignalWindow) continue;    // skip the peak region
+    sumOppositeSign += oppositeSign->GetBinContent(bin);
+    sumLikeSign += likeSign->GetBinContent(bin);
   }
-  b0Start = nReferenceBins > 0 ? b0Start / nReferenceBins : 1.0;
+  double scaleStart = sumLikeSign > 0.0 ? sumOppositeSign / sumLikeSign : 1.0;
 
-  double countsInWindow = 0.0;
-  double backgroundInWindow = 0.0;
-  for (int bin = h->FindBin(kPhiMassPDG - kSignalWindow); bin <= h->FindBin(kPhiMassPDG + kSignalWindow); ++bin) {
-    countsInWindow += h->GetBinContent(bin);
-    double dm = h->GetBinCenter(bin) - kKKThreshold;
-    if (dm > 0.0) backgroundInWindow += b0Start * std::pow(dm, aStart);
+  double yieldStart = 0.0;
+  for (int bin = oppositeSign->FindBin(kPhiMassPDG - kSignalWindow);
+       bin <= oppositeSign->FindBin(kPhiMassPDG + kSignalWindow); ++bin) {
+    yieldStart += oppositeSign->GetBinContent(bin) - scaleStart * likeSign->GetBinContent(bin);
   }
-  double yieldStart = std::max(countsInWindow - backgroundInWindow, 0.05 * countsInWindow);
-  if (yieldStart <= 0.0) yieldStart = 1.0;
+  if (yieldStart < 0.0) yieldStart = 0.0;
 
-  total->SetParameters(yieldStart, kPhiMassPDG, 0.0025, kPhiWidthPDG, b0Start, aStart, cStart);
-  total->SetParLimits(0, 0.0, 1.0e10);        // the yield cannot be negative
-  total->SetParLimits(1, 1.010, 1.030);       // keep the peak near the phi mass
-  total->SetParLimits(2, 0.0005, 0.0100);     // resolution between 0.5 and 10 MeV
-  total->FixParameter(3, kPhiWidthPDG);       // natural width is known
-  total->SetParLimits(4, 0.0, 1.0e12);
-  total->SetParLimits(5, 0.05, 4.0);
-  total->SetParLimits(6, -50.0, 50.0);
+  // The template has statistical fluctuations of its own.  We therefore fit a
+  // copy of the opposite-sign histogram whose bin errors also contain the
+  // (scaled) template errors, so that chi2 is computed with the right
+  // uncertainties.  Independent errors are added in quadrature.
+  TH1D* fitInput = static_cast<TH1D*>(oppositeSign->Clone(("fit_input_" + tag).c_str()));
+  for (int bin = 1; bin <= fitInput->GetNbinsX(); ++bin) {
+    double errorOppositeSign = oppositeSign->GetBinError(bin);
+    double errorTemplate = scaleStart * likeSign->GetBinError(bin);
+    fitInput->SetBinError(bin, std::sqrt(errorOppositeSign * errorOppositeSign + errorTemplate * errorTemplate));
+  }
 
-  // Fit options:  L = use a Poisson likelihood (correct for counting data),
-  // R = only fit inside the function's range, Q = quiet, S = return the
-  // result object, 0 = do not draw.  The first pass only improves the starting
-  // values for the second pass.
-  h->Fit(total, "LRQ0");
-  TFitResultPtr fitResult = h->Fit(total, "LRSQ");
+  TF1* model = new TF1(("fit_model_" + tag).c_str(), SignalPlusBackground, cfg.fitLow, cfg.fitHigh, 7);
+  model->SetParNames("N_{#phi}", "m_{#phi}", "#sigma", "#Gamma_{#phi}", "p_{0}", "p_{1}", "p_{2}");
+  model->SetParameters(yieldStart, kPhiMassPDG, 0.0025, kPhiWidthPDG, scaleStart, 0.0, 0.0);
+  model->SetParLimits(1, 1.012, 1.027);       // keep the peak near the phi mass
+  model->SetParLimits(2, 0.0005, 0.0080);     // resolution between 0.5 and 8 MeV
+  model->FixParameter(3, kPhiWidthPDG);       // the natural width is known
+
+  // Fit options: R = only fit inside the function's range, S = return the
+  // result object, Q = quiet, 0 = do not attach the function to the histogram.
+  // The default method minimises chi2, which is appropriate here because every
+  // bin contains many entries.
+  TFitResultPtr fitResult = fitInput->Fit(model, "RSQ0");
 
   result.status = fitResult.Get() ? fitResult->Status() : -1;
-  result.yield = total->GetParameter(0);
-  result.yieldError = total->GetParError(0);
-  result.mass = total->GetParameter(1);
-  result.massError = total->GetParError(1);
-  result.sigma = total->GetParameter(2);
-  result.sigmaError = total->GetParError(2);
-  result.chi2 = total->GetChisquare();
-  result.ndf = total->GetNDF();
-  result.total = total;
+  result.yield = model->GetParameter(0);
+  result.yieldError = model->GetParError(0);
+  result.mass = model->GetParameter(1);
+  result.massError = model->GetParError(1);
+  result.sigma = model->GetParameter(2);
+  result.sigmaError = model->GetParError(2);
+  result.chi2 = model->GetChisquare();
+  result.ndf = model->GetNDF();
 
-  // Separate copies of the two components, for drawing and for integrals.
+  // The signal as a smooth curve, for integrals and for the subtracted plot.
   result.signal = new TF1(("fit_signal_" + tag).c_str(), SignalFunction, cfg.fitLow, cfg.fitHigh, 4);
-  result.signal->SetParameters(total->GetParameter(0), total->GetParameter(1),
-                               total->GetParameter(2), total->GetParameter(3));
-  result.background = new TF1(("fit_background_" + tag).c_str(), BackgroundFunction, cfg.fitLow, cfg.fitHigh, 3);
-  result.background->SetParameters(total->GetParameter(4), total->GetParameter(5), total->GetParameter(6));
+  result.signal->SetParameters(model->GetParameter(0), model->GetParameter(1),
+                               model->GetParameter(2), model->GetParameter(3));
 
-  // TF1::Integral gives the area under the curve; dividing by the bin width
-  // converts it back into a number of entries.
+  // The background and the total are stored bin by bin (the template is a
+  // histogram, so they are not smooth curves).  Outside the fit range they
+  // are left empty.
+  result.background = static_cast<TH1D*>(likeSign->Clone(("fit_background_" + tag).c_str()));
+  result.total = static_cast<TH1D*>(oppositeSign->Clone(("fit_total_" + tag).c_str()));
+  double backgroundParameters[3] = {model->GetParameter(4), model->GetParameter(5), model->GetParameter(6)};
+  for (int bin = 1; bin <= result.total->GetNbinsX(); ++bin) {
+    double m = result.total->GetBinCenter(bin);
+    double background = 0.0;
+    double total = 0.0;
+    if (m >= cfg.fitLow && m <= cfg.fitHigh) {
+      background = BackgroundFunction(&m, backgroundParameters);
+      total = background + result.signal->Eval(m);
+    }
+    result.background->SetBinContent(bin, background);
+    result.background->SetBinError(bin, 0.0);
+    result.total->SetBinContent(bin, total);
+    result.total->SetBinError(bin, 0.0);
+  }
+
+  // Signal and background within +- 10 MeV of the fitted peak.  TF1::Integral
+  // gives the area under the curve; dividing by the bin width converts it
+  // into a number of entries.
   double windowLow = result.mass - kSignalWindow;
   double windowHigh = result.mass + kSignalWindow;
   result.signalInWindow = result.signal->Integral(windowLow, windowHigh) / gMassBinWidth;
-  result.backgroundInWindow = result.background->Integral(windowLow, windowHigh) / gMassBinWidth;
+  result.backgroundInWindow = result.background->Integral(result.background->FindBin(windowLow),
+                                                          result.background->FindBin(windowHigh));
   return result;
 }
 
@@ -625,8 +665,8 @@ TH1D* BackgroundSubtractedCopy(const TH1D* h, const PhiFitResult& fit, double nE
       copy->SetBinContent(bin, 0.0);
       copy->SetBinError(bin, 0.0);
     } else {
-      copy->SetBinContent(bin, h->GetBinContent(bin) - fit.background->Eval(center));
-      copy->SetBinError(bin, h->GetBinError(bin));   // the subtraction adds no statistical error
+      copy->SetBinContent(bin, h->GetBinContent(bin) - fit.background->GetBinContent(bin));
+      copy->SetBinError(bin, h->GetBinError(bin));   // the fitted background carries no error here
     }
   }
   if (nEvents > 0.0) copy->Scale(1.0 / nEvents);
@@ -745,7 +785,16 @@ TH1D* DrawSpectrumComparison(TH1D* hData, TH1D* hMC, TH1D* hGen, const Config& c
   if (hGen) hGen->Draw("HIST SAME");
   hData->Draw("E1 P SAME");            // "E1 P": points with error bars
 
-  TLegend legend(0.55, 0.66, 0.93, 0.88);
+  // A falling spectrum on a log scale leaves the lower left corner empty; a
+  // bell-shaped distribution on a linear scale leaves the upper right empty.
+  double legendX1 = 0.55, legendY1 = 0.58, legendX2 = 0.93, legendY2 = 0.78;   // upper right
+  if (logY) {
+    legendX1 = 0.17;
+    legendY1 = 0.08;
+    legendX2 = 0.55;
+    legendY2 = 0.28;                                                             // lower left
+  }
+  TLegend legend(legendX1, legendY1, legendX2, legendY2);
   legend.SetBorderSize(0);
   legend.SetFillStyle(0);
   legend.AddEntry(hData, "OPAL 1994 data", "lp");
@@ -767,7 +816,10 @@ TH1D* DrawSpectrumComparison(TH1D* hData, TH1D* hMC, TH1D* hGen, const Config& c
   ratio->GetXaxis()->SetTitleSize(0.13);
   ratio->GetXaxis()->SetTitleOffset(1.1);
   ratio->GetXaxis()->SetLabelSize(0.10);
-  if (logX) ratio->GetXaxis()->SetMoreLogLabels();
+  if (logX) {
+    ratio->GetXaxis()->SetMoreLogLabels();
+    ratio->GetXaxis()->SetNoExponent(true);   // "0.2" instead of "2x10^-1"
+  }
   ratio->SetMinimum(0.4);
   ratio->SetMaximum(1.6);
   ratio->Draw("E1 P");
@@ -796,36 +848,35 @@ void DrawPhiFit(TPad* pad, Sample& s, const PhiFitResult& fit) {
   likeSign->SetFillColor(kGray);
   likeSign->SetLineColor(kGray + 1);
   oppositeSign->SetMinimum(0.0);
-  oppositeSign->SetMaximum(1.3 * std::max(oppositeSign->GetMaximum(), likeSign->GetMaximum()));
+  // Generous head room: the legend and the fit results go above the spectrum.
+  oppositeSign->SetMaximum(3.0 * std::max(oppositeSign->GetMaximum(), likeSign->GetMaximum()));
   oppositeSign->GetYaxis()->SetTitleOffset(1.5);
 
   oppositeSign->Draw("AXIS");          // first only the axes, to fix the frame
-  likeSign->Draw("HIST SAME");         // grey background reference
+  likeSign->Draw("HIST SAME");         // grey: the raw like-sign template
   oppositeSign->Draw("E1 P SAME");     // the spectrum with the phi
-  if (fit.total) {
-    fit.total->SetLineColor(kRed + 1);
-    fit.total->SetLineWidth(2);
-    fit.total->SetNpx(1000);           // draw the curve smoothly
-    fit.total->Draw("SAME");
-  }
   if (fit.background) {
     fit.background->SetLineColor(kBlue + 1);
     fit.background->SetLineStyle(2);
     fit.background->SetLineWidth(2);
-    fit.background->SetNpx(1000);
-    fit.background->Draw("SAME");
+    fit.background->Draw("HIST SAME"); // dashed blue: template scaled by the fit
+  }
+  if (fit.total) {
+    fit.total->SetLineColor(kRed + 1);
+    fit.total->SetLineWidth(2);
+    fit.total->Draw("HIST SAME");      // red: background + Voigtian signal
   }
   oppositeSign->Draw("AXIS SAME");     // redraw the axes on top
 
   // The legend is created with "new" because the canvas is only saved after
   // this function returns; a local object would already have been destroyed.
-  TLegend* legend = new TLegend(0.50, 0.70, 0.94, 0.90);
+  TLegend* legend = new TLegend(0.52, 0.68, 0.94, 0.84);   // below the header line
   legend->SetBorderSize(0);
   legend->SetFillStyle(0);
   legend->AddEntry(oppositeSign, (s.label + ", K^{+}K^{-} pairs").c_str(), "lp");
-  legend->AddEntry(likeSign, "like-sign pairs", "f");
-  if (fit.total) legend->AddEntry(fit.total, "Voigtian + background", "l");
-  if (fit.background) legend->AddEntry(fit.background, "background", "l");
+  legend->AddEntry(likeSign, "like-sign pairs (raw template)", "f");
+  if (fit.background) legend->AddEntry(fit.background, "fitted background", "l");
+  if (fit.total) legend->AddEntry(fit.total, "background + Voigtian signal", "l");
   legend->Draw();
 
   double nEvents = std::max(1LL, s.nEventsSelected);
@@ -833,9 +884,9 @@ void DrawPhiFit(TPad* pad, Sample& s, const PhiFitResult& fit) {
   TLatex latex;
   latex.SetNDC();
   latex.SetTextFont(42);
-  latex.SetTextSize(0.032);
-  double y = 0.62;
-  const double lineStep = 0.045;
+  latex.SetTextSize(0.030);
+  double y = 0.63;
+  const double lineStep = 0.040;
   latex.DrawLatex(0.50, y, Form("N_{#phi} = %.0f #pm %.0f", fit.yield, fit.yieldError));
   y -= lineStep;
   latex.DrawLatex(0.50, y, Form("N_{#phi}/event = (%.3f #pm %.3f) #times 10^{-3}",
@@ -880,7 +931,7 @@ void DrawSubtractedPeaks(TH1D* subData, TH1D* subMC, const Config& cfg, const st
   zero.SetLineStyle(2);
   zero.Draw();
 
-  TLegend legend(0.50, 0.72, 0.94, 0.88);
+  TLegend legend(0.55, 0.62, 0.94, 0.78);   // below the header lines
   legend.SetBorderSize(0);
   legend.SetFillStyle(0);
   legend.AddEntry(subData, "OPAL 1994 data", "lp");
@@ -904,7 +955,7 @@ void AddSampleSummary(std::ostringstream& out, const Sample& s) {
 void AddPhiSummary(std::ostringstream& out, const Sample& s, const PhiFitResult& fit) {
   double nEvents = std::max(1LL, s.nEventsSelected);
   double signalOverBackground = fit.backgroundInWindow > 0 ? fit.signalInWindow / fit.backgroundInWindow : 0.0;
-  out << Form("  %-28s fit status %d\n", s.label.c_str(), fit.status);
+  out << Form("  %-28s fit status %d (0 = converged)\n", s.label.c_str(), fit.status);
   out << Form("      N_phi            = %10.0f +- %7.0f   (%.4f +- %.4f) x 10^-3 per event\n",
               fit.yield, fit.yieldError, 1000.0 * fit.yield / nEvents, 1000.0 * fit.yieldError / nEvents);
   out << Form("      mass             = %8.3f +- %.3f MeV   (PDG %.3f MeV)\n",
@@ -981,9 +1032,9 @@ void PrintUsage() {
          "  --cosThetaMax X      [0.966]        --d0Max X [2.5 cm]   --z0Max X [50 cm]\n"
          "phi -> K+K- candidates:\n"
          "  --kaonPMin X         minimum momentum of each kaon candidate [0 GeV]\n"
-         "  --phiPMin X          minimum momentum of the pair [0 GeV]\n"
+         "  --phiPMin X          minimum momentum of the pair [6 GeV; 0 = inclusive]\n"
          "  --massLow/--massHigh/--massBinWidth   mass histogram [0.98 / 1.10 / 0.001 GeV]\n"
-         "  --fitLow/--fitHigh   fit range [0.990 / 1.090 GeV]\n"
+         "  --fitLow/--fitHigh   fit range [0.995 / 1.090 GeV]\n"
          "pT normalisation:\n"
          "  --normalize MODE     event = (1/N_ev) dN/dpT,  area = unit area [event]\n"
       << std::endl;
@@ -1012,11 +1063,11 @@ int main(int argc, char** argv) {
   cfg.d0Max = cl.GetDouble("d0Max", 2.5);
   cfg.z0Max = cl.GetDouble("z0Max", 50.0);
   cfg.kaonPMin = cl.GetDouble("kaonPMin", 0.0);
-  cfg.phiPMin = cl.GetDouble("phiPMin", 0.0);
+  cfg.phiPMin = cl.GetDouble("phiPMin", 6.0);
   cfg.massLow = cl.GetDouble("massLow", 0.98);
   cfg.massHigh = cl.GetDouble("massHigh", 1.10);
   cfg.massBinWidth = cl.GetDouble("massBinWidth", 0.001);
-  cfg.fitLow = cl.GetDouble("fitLow", 0.990);
+  cfg.fitLow = cl.GetDouble("fitLow", 0.995);
   cfg.fitHigh = cl.GetDouble("fitHigh", 1.090);
   cfg.normalize = cl.GetString("normalize", "event");
   if (cfg.normalize != "event" && cfg.normalize != "area") {
@@ -1031,6 +1082,7 @@ int main(int argc, char** argv) {
   gStyle->SetOptTitle(0);               // no histogram title above the plot
   gStyle->SetPadTickX(1);               // tick marks on all four sides
   gStyle->SetPadTickY(1);
+  TGaxis::SetMaxDigits(4);              // write 25000 as 25 x 10^3 on the axes
   TH1::SetDefaultSumw2(true);           // keep proper statistical errors when scaling
   TH1::AddDirectory(false);             // histograms are not tied to the input files
 
@@ -1067,8 +1119,8 @@ int main(int argc, char** argv) {
   if (cfg.useGen) FillHistogramsFromTree(genTree, cfg, true, gen);
 
   // ---- 5. fit the phi peaks -------------------------------------------------
-  PhiFitResult fitData = FitPhiPeak(data.hMassOS, cfg, "data");
-  PhiFitResult fitMC = FitPhiPeak(mc.hMassOS, cfg, "mc");
+  PhiFitResult fitData = FitPhiPeak(data.hMassOS, data.hMassLS, cfg, "data");
+  PhiFitResult fitMC = FitPhiPeak(mc.hMassOS, mc.hMassLS, cfg, "mc");
 
   // ---- 6. normalised copies for the comparison plots -------------------------
   TH1D* ptData = NormalizedCopy(data.hPt, data.nEventsSelected, cfg.normalize, "_norm");
@@ -1134,9 +1186,9 @@ int main(int argc, char** argv) {
     if (h) h->Write();
   }
   for (const PhiFitResult* fit : {&fitData, &fitMC}) {
-    if (fit->total) fit->total->Write();
     if (fit->signal) fit->signal->Write();
     if (fit->background) fit->background->Write();
+    if (fit->total) fit->total->Write();
   }
   TNamed summaryObject("summary", summary.c_str());
   summaryObject.Write();

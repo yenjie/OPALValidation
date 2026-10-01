@@ -7,12 +7,14 @@
 #
 # Environment variables:
 #   REPO        local checkout of OPALValidation [/raid5/data/yjlee/OPAL/OPALValidation]
+#   REPO_URL    where to clone from if REPO does not exist yet [SSH URL of the GitHub repo]
 #   SUBDIR      directory inside the repository  [DataMCValidation]
 #   TEST_EVENTS events per tree for the test run [20000]
 set -euo pipefail
 
 SRC=$(cd "$(dirname "$0")" && pwd)
 REPO=${REPO:-/raid5/data/yjlee/OPAL/OPALValidation}
+REPO_URL=${REPO_URL:-git@github.com:yenjie/OPALValidation.git}
 SUBDIR=${SUBDIR:-DataMCValidation}
 TEST_EVENTS=${TEST_EVENTS:-20000}
 MERGED=/raid5/data/yjlee/OPAL/converted/1994/merged
@@ -40,7 +42,7 @@ fi
 
 # ---- 3. copy into the repository and push -----------------------------------
 if [ ! -d "$REPO/.git" ]; then
-  git clone https://github.com/yenjie/OPALValidation.git "$REPO"
+  git clone "$REPO_URL" "$REPO"
 fi
 mkdir -p "$REPO/$SUBDIR"
 cp "$SRC/CompareDataMC.cpp" "$SRC/Makefile" "$SRC/README.md" \
